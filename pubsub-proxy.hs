@@ -2,14 +2,15 @@
 
 module Main where
 
-import Data.Maybe               (fromMaybe)
-import Data.ByteString          (ByteString)
-import Data.ByteString.Char8    (unpack)
-import Control.Monad            (forever)
-import Control.Applicative      (liftA)
-import System.Environment       (getEnvironment)
+import Data.Maybe                   (fromMaybe)
+import Data.ByteString              (ByteString)
+import Data.ByteString.Char8        (unpack)
+import Control.Applicative          (liftA)
+import Control.Monad                (forever, void)
+import Control.Concurrent           (forkIO)
+import System.Environment           (getEnvironment)
 import System.Log.Logger
-import System.ZMQ3.Monadic
+import System.ZMQ3
 
 --------------------------------------------------------------------------------
 -- zeromq
@@ -19,40 +20,25 @@ type Dsn = String
 logDsn :: Dsn
 logDsn = "inproc://logger"
 
-initSubscriber :: Dsn -> ZMQ z (Socket z XSub)
-initSubscriber dsn = do
-   s <- socket XSub
-   bind s dsn
-   return s
+usingSocket :: SocketType a => Context -> Dsn -> a -> (Socket a -> IO b) -> IO b
+usingSocket ctx dsn stype cb = withSocket ctx stype $ \s -> bind s dsn >> cb s
 
-initPublisher :: Dsn -> ZMQ z (Socket z XPub)
-initPublisher dsn = do
-   s <- socket XPub
-   bind s dsn
-   return s
+usingCapturer :: Context -> (Socket Pair -> IO a) -> IO a
+usingCapturer ctx cb = withSocket ctx Pair $ \s -> connect s logDsn >> cb s
 
-initCapturer :: ZMQ z (Socket z Pair)
-initCapturer = do
-   s <- socket Pair
-   connect s logDsn
-   return s
+usingLogger :: Context -> (Socket Pair -> IO a) -> IO a
+usingLogger ctx cb = withSocket ctx Pair $ \s -> bind s logDsn >> cb s
 
-initLogger :: ZMQ z (Socket z Pair)
-initLogger = do
-   s <- socket Pair
-   bind s logDsn
-   return s
-
-receiveFirst :: Receiver a => Socket z a -> ZMQ z ByteString
+receiveFirst :: Receiver a => Socket a -> IO ByteString
 receiveFirst s = liftA head (receiveMulti s)
 
 --------------------------------------------------------------------------------
 -- logger
 --------------------------------------------------------------------------------
-logger :: ZMQ z ()
-logger =  do
-   s <- initLogger
-   forever $ receiveFirst s >>= liftIO . infoM "pubsub-proxy.logger" . unpack
+logger :: Context -> IO ()
+logger ctx = usingLogger ctx $ \s -> do
+   updateGlobalLogger rootLoggerName (setLevel INFO)
+   forever $ receiveFirst s >>= infoM "pubsub-proxy.logger" . unpack 
 
 --------------------------------------------------------------------------------
 -- main
@@ -65,10 +51,11 @@ main = do
    let pdsn = fromMaybe "tcp://127.0.0.1:7006" $ lookup "ZMQPUBLISHER"  env
    let sdsn = fromMaybe "tcp://127.0.0.1:7004" $ lookup "ZMQSUBSCRIBER" env
    infoM "pubsub-proxy.main" "Starting logger"
-   runZMQ $ do
-      liftIO $ debugM "pubsub-proxy.main" "Configuring sockets"
-      pub <- initPublisher  pdsn
-      sub <- initSubscriber sdsn
-      -- capturer <- initCapturer
-      liftIO $ infoM "pubsub-proxy.main" "PubSub proxy"
-      proxy pub sub Nothing -- (Just capturer) 
+   withContext $ \ctx -> do
+      void . forkIO $ logger ctx
+      debugM "pubsub-proxy.main" "Configuring sockets"
+      usingCapturer  ctx           $ \cap -> 
+         usingSocket ctx pdsn XPub $ \pub -> 
+         usingSocket ctx sdsn XSub $ \sub -> do
+            infoM "pubsub-proxy.main" "PubSub proxy"
+            proxy pub sub (Just cap) 
